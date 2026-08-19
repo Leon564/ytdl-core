@@ -1,7 +1,9 @@
 # PoToken support for full-length adaptive downloads
 
 **Date:** 2026-08-18
-**Status:** Approved, pending implementation
+**Status:** SUPERSEDED — the PoToken route was tested and does not work. See
+[Outcome](#outcome-route-b-is-closed) at the end of this document. The problem statement
+and measurements below remain accurate and are worth keeping; the proposed solution is not.
 **Branch base:** `fix/update-innertube-client-versions`
 
 ## Problem
@@ -157,3 +159,85 @@ Network-dependent tests are marked so they can be skipped in CI.
 
 Whether cookies alone unblock ANDROID_VR cannot be tested without real credentials. If
 they do, Route A is a zero-dependency path worth documenting prominently.
+
+---
+
+## Outcome: Route B is closed
+
+Three feasibility spikes were run before writing production code. All three failed to lift
+the ceiling. BotGuard minting itself worked every time — the tokens were valid, well-formed,
+and correctly attached. YouTube simply does not honour them for these streaming URLs.
+
+### Spike 1 — WEB token on an IOS/ANDROID URL
+
+Minted a 116-character content-bound token and appended `&pot=` to an existing IOS/ANDROID
+streaming URL.
+
+| Probe | Without pot | With pot |
+| --- | --- | --- |
+| offset 0 (32 KB) | 206 | 206 |
+| offset 80% (8.2 MB) | 403 | **403** |
+
+The offset-0 control proves the URL stayed intact and the token was genuinely attached.
+Verdict: FAIL.
+
+### Spike 2 — everything inside one WEB session
+
+Hypothesis: the token must match the client and session that issued the URL. This spike
+extracted `INNERTUBE_CLIENT_VERSION`, `VISITOR_DATA` and the signature timestamp from the
+live watch page, minted a session token bound to that `visitorData`, and sent a WEB player
+request carrying it.
+
+The hypothesis was never testable. **The plain WEB client no longer returns per-format
+streaming URLs at all.** All 40 `adaptiveFormats` came back with no `url`, no
+`signatureCipher`, and no `cipher`; `streamingData` carried only `serverAbrStreamingUrl`
+(SABR/UMP). Control checks confirmed this is unconditional server behaviour — identical
+response shape with no `visitorData` and no token, and already present in the raw watch
+page HTML.
+
+This rules out the WEB client for this library's architecture, which depends on HTTP Range
+requests against direct format URLs. It also explains retroactively why `lib/info.js` never
+used the plain WEB client. Verdict: INCONCLUSIVE, hypothesis untestable by this route.
+
+### Spike 3 — IOS/ANDROID player request carrying a session token
+
+The remaining untested variant: rather than patching a token onto a URL that was already
+issued restricted, send the token *with* the player request so the URL is minted
+authenticated. Both clients, three token variants, with offset-0 controls.
+
+| Client | itag | offset 0 (a/b/c) | offset 80% (a/b/c) |
+| --- | --- | --- | --- |
+| IOS | 251 | 206 / 206 / 206 | 403 / 403 / 403 |
+| ANDROID | 258 | 206 / 206 / 206 | 403 / 403 / 403 |
+
+(a) untouched, (b) session token bound to `visitorData`, (c) content token bound to the
+video id. Verdict: FAIL.
+
+### Conclusion
+
+`bgutils-js` mints **WebPO** tokens. The clients that still return usable per-format URLs
+in this fork are IOS and ANDROID, which do not accept them, and the WEB client that would
+accept them no longer returns per-format URLs. The two halves cannot be joined with the
+tools available.
+
+The implementation plan at `docs/superpowers/plans/2026-08-18-potoken-support.md` was
+halted at its Task 1 gate and Tasks 2-7 were never executed. `bgutils-js` and `jsdom` were
+removed from `devDependencies` after the spikes.
+
+### What remains viable
+
+**Route A: ANDROID_VR with cookies.** Per the yt-dlp PO Token guide, `android_vr` requires
+no GVS token for streaming. It is blocked here only at the player stage, with
+`LOGIN_REQUIRED` / "Sign in to confirm you're not a bot" — a bot check that authenticated
+cookies normally lift. This is untested because it needs real credentials. It remains the
+most promising path and costs no new dependencies.
+
+**Known-good today:** progressive formats (itag 18) download completely, and any video
+under ~60 seconds downloads completely in any format.
+
+### An operational note for the future
+
+Getting the BotGuard minter working in Node required a fix worth recording: the challenge
+interpreter must be evaluated via indirect `eval` into Node's own realm, **not** through
+`jsdomWindow.eval`. Running it inside the jsdom realm makes `WebPoMinter.create` fail
+cross-realm `instanceof` checks with `APF:Failed`. Anyone revisiting this will hit it.
